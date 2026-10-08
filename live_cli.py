@@ -42,6 +42,12 @@ from bs4 import BeautifulSoup
 
 MODEL = "magistral-medium-latest"
 
+OLLAMA_BASE_URL = os.environ.get("OLLAMA_HOST", "https://ollama.com")
+if not OLLAMA_BASE_URL.startswith(("http://", "https://")):
+    OLLAMA_BASE_URL = f"https://{OLLAMA_BASE_URL}"
+OLLAMA_DEFAULT_MODEL = os.environ.get("OLLAMA_DEFAULT_MODEL", "llama3.1")
+OLLAMA_API_KEY = os.environ.get("OLLAMA_API_KEY", "")
+
 DIR = os.path.dirname(os.path.abspath(__file__))
 SESSION_DIR = os.path.realpath(os.getcwd())
 AGENTJOB_BIN = os.path.join(DIR, "tools", "job_runner.py")
@@ -54,6 +60,13 @@ try:
     load_project_env(SESSION_DIR)
 except Exception:
     pass
+
+# Re-read Ollama settings now that .env has been loaded
+OLLAMA_BASE_URL = os.environ.get("OLLAMA_HOST", "https://ollama.com")
+if not OLLAMA_BASE_URL.startswith(("http://", "https://")):
+    OLLAMA_BASE_URL = f"https://{OLLAMA_BASE_URL}"
+OLLAMA_DEFAULT_MODEL = os.environ.get("OLLAMA_DEFAULT_MODEL", "llama3.1")
+OLLAMA_API_KEY = os.environ.get("OLLAMA_API_KEY", "")
 
 
 @dataclass(frozen=True)
@@ -934,6 +947,7 @@ class TextLoop:
         self._gemini_thinking_budget = 4096
         self._gemini_tools = GEMINI_TOOLS
         self._gemini_history = []
+        self._ollama_history = []
 
     def reload_tool_store(self):
         """Reload TOOL-STORE from disk directly into memory."""
@@ -3003,11 +3017,189 @@ class TextLoop:
             })
             await asyncio.sleep(0.5)
 
+    # ── Ollama streaming inference ──────────────────────────────────
+
+    async def _call_ollama_and_dispatch(self, user_text: str):
+        """
+        Stream from a local/remote Ollama server's native /api/chat endpoint.
+        Each streamed line is a standalone JSON object (NDJSON) -- there is
+        no 'data: ' SSE prefix. Tool calls arrive whole (arguments already a
+        dict), unlike Mistral/OpenAI-style incremental argument fragments.
+        """
+        self._ollama_history.append({"role": "user", "content": user_text})
+
+        if self._active_model.startswith("ollama:"):
+            ollama_model = self._active_model.split(":", 1)[1] or OLLAMA_DEFAULT_MODEL
+        else:
+            ollama_model = OLLAMA_DEFAULT_MODEL
+
+        system_content = SYSTEM_INSTRUCTION
+        if self._tool_store_content:
+            system_content += f"\n\n---\n# AUTHORITATIVE TOOL STORE (LOADED TO MEMORY AT STARTUP)\n{self._tool_store_content}"
+
+        while True:
+            body = {
+                "model": ollama_model,
+                "messages": [{"role": "system", "content": system_content}] + self._ollama_history,
+                "tools": TOOLS,
+                "stream": True,
+            }
+
+            event_q: asyncio.Queue = asyncio.Queue()
+            loop = asyncio.get_running_loop()
+
+            def _do_stream(b=body):
+                delay = 1.5
+                headers = {"Content-Type": "application/json"}
+                if OLLAMA_API_KEY:
+                    headers["Authorization"] = f"Bearer {OLLAMA_API_KEY}"
+                for _attempt in range(3):
+                    try:
+                        resp = requests.post(
+                            f"{OLLAMA_BASE_URL}/api/chat",
+                            json=b, headers=headers, stream=True, timeout=300,
+                        )
+                        if resp.status_code != 200:
+                            err_msg = resp.text
+                            try:
+                                err_msg = resp.json().get("error", resp.text)
+                            except Exception:
+                                pass
+                            loop.call_soon_threadsafe(
+                                event_q.put_nowait,
+                                ("error", f"Ollama API error ({resp.status_code}): {err_msg}"),
+                            )
+                            return
+                        for raw in resp.iter_lines():
+                            if raw:
+                                loop.call_soon_threadsafe(event_q.put_nowait, ("line", raw))
+                        loop.call_soon_threadsafe(event_q.put_nowait, ("done", None))
+                        return
+                    except requests.exceptions.ConnectionError:
+                        if _attempt < 2:
+                            time.sleep(delay)
+                            delay *= 2
+                            continue
+                        loop.call_soon_threadsafe(
+                            event_q.put_nowait,
+                            ("error", f"Could not reach Ollama at {OLLAMA_BASE_URL}. Is `ollama serve` running and is `{ollama_model}` pulled?"),
+                        )
+                        return
+                    except Exception as exc:
+                        loop.call_soon_threadsafe(event_q.put_nowait, ("error", str(exc)))
+                        return
+
+            threading.Thread(target=_do_stream, daemon=True).start()
+
+            text_chunks = []
+            tool_calls_acc = []
+            line_buf = ""
+
+            while True:
+                if self._interrupt_event.is_set():
+                    self._interrupt_event.clear()
+                    if line_buf.strip():
+                        out(line_buf)
+                    out("<<END>>")
+                    return
+
+                try:
+                    kind, data = await asyncio.wait_for(event_q.get(), timeout=300.0)
+                except asyncio.TimeoutError:
+                    if line_buf.strip():
+                        out(line_buf)
+                    out("<<END>>")
+                    return
+
+                if kind == "error":
+                    if line_buf.strip():
+                        out(line_buf)
+                    out(f"> [!WARNING]\n> **Ollama Error**: {data}\n>\n> Please type `/models` to pick another model.")
+                    out("<<END>>")
+                    return
+                if kind == "done":
+                    break
+
+                try:
+                    chunk = json.loads(data.decode("utf-8", "replace") if isinstance(data, bytes) else data)
+                except json.JSONDecodeError:
+                    continue
+
+                if chunk.get("error"):
+                    if line_buf.strip():
+                        out(line_buf)
+                    out(f"> [!WARNING]\n> **Ollama Error**: {chunk['error']}")
+                    out("<<END>>")
+                    return
+
+                message = chunk.get("message") or {}
+
+                thinking_piece = message.get("thinking") or ""
+                if thinking_piece:
+                    out("<<THINKING>>" + json.dumps({"text": thinking_piece}))
+
+                text_piece = message.get("content") or ""
+                if text_piece:
+                    text_chunks.append(text_piece)
+                    line_buf += text_piece
+                    while "\n" in line_buf:
+                        nl = line_buf.index("\n")
+                        out(line_buf[:nl])
+                        line_buf = line_buf[nl + 1:]
+
+                for tc in (message.get("tool_calls") or []):
+                    tool_calls_acc.append(tc)
+
+                if chunk.get("done"):
+                    break
+
+            if line_buf.strip():
+                out(line_buf)
+
+            full_text = "".join(text_chunks)
+
+            if not tool_calls_acc:
+                if full_text:
+                    self._ollama_history.append({"role": "assistant", "content": full_text})
+                out("<<END>>")
+                return
+
+            self._ollama_history.append({
+                "role": "assistant",
+                "content": full_text,
+                "tool_calls": tool_calls_acc,
+            })
+
+            for tc in tool_calls_acc:
+                fn = tc.get("function", {}) if isinstance(tc, dict) else {}
+                name = fn.get("name", "")
+                raw_args = fn.get("arguments")
+                if isinstance(raw_args, str):
+                    try:
+                        args_dict = json.loads(raw_args or "{}")
+                    except json.JSONDecodeError:
+                        args_dict = {}
+                elif isinstance(raw_args, dict):
+                    args_dict = raw_args
+                else:
+                    args_dict = {}
+
+                _, result = await self.execute_tool(name, args_dict)
+                self._ollama_history.append({
+                    "role": "tool",
+                    "tool_name": name,
+                    "content": json.dumps(result),
+                })
+
+            await asyncio.sleep(0.5)
+
         # ── Scheduler ─────────────────────────────────────────────────
 
     async def dispatch_prompt(self, text: str):
         if self._active_model.startswith("gemini"):
             await self._call_gemini_and_dispatch(text)
+        elif self._active_model.startswith("ollama"):
+            await self._call_ollama_and_dispatch(text)
         else:
             await self._call_mistral_and_dispatch(text)
 

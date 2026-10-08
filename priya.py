@@ -167,7 +167,7 @@ COMMANDS = [
     ("/diff", "Show git diff of unstaged changes"),
     ("/clear", "Clear conversation screen"),
     ("/tools", "List all available Priya tools"),
-    ("/models", "Switch active model (Mistral / Gemini 3.8 Flash)"),
+    ("/models", "Switch active model (Mistral / Gemini / Ollama)"),
     ("/model", "View active model information"),
     ("/delete", "Pick and delete a chat from project history"),
     ("/onboarding", "Configure or switch API keys (Mistral / Gemini)"),
@@ -543,6 +543,24 @@ def build_splash(w, model_name, cwd):
     return out
 
 # ── Terminal size ─────────────────────────────────────────────────────────────
+
+def fetch_ollama_models(timeout=8):
+    """Return installed/remote Ollama model names via GET /api/tags ([] if unreachable)."""
+    import urllib.request
+    base = os.environ.get("OLLAMA_HOST", "https://ollama.com")
+    if not base.startswith(("http://", "https://")):
+        base = "https://" + base
+    headers = {}
+    api_key = os.environ.get("OLLAMA_API_KEY", "")
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    try:
+        req = urllib.request.Request(base.rstrip("/") + "/api/tags", headers=headers)
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            data = json.loads(r.read().decode("utf-8", "replace"))
+        return sorted(m["name"] for m in data.get("models", []) if m.get("name"))
+    except Exception:
+        return []
 
 def terminal_size():
     try:
@@ -1125,10 +1143,18 @@ class Screen:
                 drop_lines.append(C_BORDER + "│ " + RESET + C_AI + q_disp + RESET + q_pad + C_BORDER + " │" + RESET)
                 drop_lines.append(C_BORDER + "├" + "─" * (box_w - 2) + "┤" + RESET)
 
+            max_opts = max(3, status_row - 7)
+            if len(opts) <= max_opts:
+                w_start, w_end = 0, len(opts)
+            else:
+                w_start = max(0, min(sel_idx - max_opts // 2, len(opts) - max_opts))
+                w_end = w_start + max_opts
             for i, opt in enumerate(opts):
+                if i < w_start or i >= w_end:
+                    continue
                 is_sel = (i == sel_idx)
                 lbl = opt.get("label", "")
-                desc = opt.get("description", "")
+                desc = opt.get("description", "") if is_sel else ""
                 if is_sel:
                     opt_str = f"❯ [{i + 1}] {lbl}"
                     opt_disp = fit_line(opt_str, content_w)
@@ -2361,7 +2387,7 @@ class PriyaApp:
             self._do_submit()
             return
 
-        if self._question_state and key in "123456789" and not s.input_text:
+        if self._question_state and key in "123456789" and not s.input_text and not self._sel_is_custom():
             idx = int(key) - 1
             qs = self._question_state
             q = qs["questions"][qs["index"]]
@@ -2377,7 +2403,7 @@ class PriyaApp:
                 self._submit_question_choice()
                 return
 
-        if self._question_state and not s.input_text and key.lower() in ("o", "c"):
+        if self._question_state and not s.input_text and not self._sel_is_custom() and key.lower() in ("o", "c"):
             qs = self._question_state
             q = qs["questions"][qs["index"]]
             opts = q.get("options", [])
@@ -2390,7 +2416,7 @@ class PriyaApp:
                     s.redraw()
                     return
 
-        if self._question_state and not s.input_text and key.lower() == "s":
+        if self._question_state and not s.input_text and not self._sel_is_custom() and key.lower() == "s":
             self._skip_question()
             return
 
@@ -2410,6 +2436,16 @@ class PriyaApp:
                 s._cache_dirty = True
             s.redraw()
             return
+
+    def _sel_is_custom(self):
+        qs = self._question_state
+        if not qs:
+            return False
+        try:
+            opts = qs["questions"][qs["index"]].get("options", [])
+            return bool(opts[qs.get("selected_option", 0)].get("custom"))
+        except Exception:
+            return False
 
     def _execute_slash_command(self, text):
         cmd = text.split()[0].lower()
@@ -2553,7 +2589,7 @@ class PriyaApp:
 | `/clear` | Clear conversation history |
 | `/tools` | List all 14 tools & descriptions |
 | `/model` | Active model information |
-| `/models` | Switch model (Mistral / Gemini 3.8 Flash) |
+| `/models` | Switch model (Mistral / Gemini / Ollama) |
 | `/delete` | Pick and delete a chat from project history |
 | `/onboarding` | Configure or switch API keys (Mistral / Gemini) |
 | `/history` | Recent prompt history |
@@ -2668,7 +2704,7 @@ class PriyaApp:
 - **Worker**: `live_cli.py` (asyncio event loop)
 - **Protocol**: Framing `<<TOOL_*>>`, `<<ASK_*>>`, `<<EDIT_*>>`, `<<SET_MODEL>>`
 
-Type `/models` to switch between `mistral-medium-latest` and `Gemini 3.8 Flash`.
+Type `/models` to switch between Mistral, Gemini and local Ollama models.
 """
         turn.ai_lines.append(model_md.strip())
         self.screen.end_turn()
@@ -2722,6 +2758,29 @@ Type `/models` to switch between `mistral-medium-latest` and `Gemini 3.8 Flash`.
             "is_model_picker": True,
             "step": 1,
         }
+        _opts = qs["questions"][0]["options"]
+        _skip_opt = _opts.pop()  # keep Skip as the last entry
+        _names = fetch_ollama_models()
+        for _n in _names[:8]:
+            _opts.append({
+                "label": f"Ollama: {_n}",
+                "description": "Local Ollama model (tool use needs a tool-capable model)",
+                "ollama_model": _n,
+            })
+        _opts.append({
+            "label": "Ollama: custom model…",
+            "description": "Type a model name, e.g. qwen2.5-coder:7b" if _names
+                           else "Ollama unreachable or no models pulled — type a model name",
+            "custom": True,
+            "ollama_custom": True,
+        })
+        _opts.append(_skip_opt)
+        if self.active_model.startswith("ollama:"):
+            _cur = self.active_model.split(":", 1)[1]
+            qs["selected_option"] = next(
+                (i for i, o in enumerate(_opts) if o.get("ollama_model") == _cur),
+                next((i for i, o in enumerate(_opts) if o.get("ollama_custom")), 0),
+            )
         self._question_state = qs
         self.screen.set_question(qs)
         self.screen.set_status("Select model: ↑/↓ choose • Enter confirm • 's' or Esc cancel", C_TOOL_Y)
@@ -2871,6 +2930,37 @@ Type `/models` to switch between `mistral-medium-latest` and `Gemini 3.8 Flash`.
             ans_clean = ans.strip().lower()
             if ans_clean == "skip":
                 self._skip_question()
+                return
+
+            _o_opts = qs["questions"][qs["index"]].get("options", [])
+            _o_sel = qs.get("selected_option", 0)
+            _o_opt = _o_opts[_o_sel] if 0 <= _o_sel < len(_o_opts) else {}
+            if _o_opt.get("ollama_model") or _o_opt.get("ollama_custom"):
+                o_name = (_o_opt.get("ollama_model") or ans).strip()
+                if o_name.lower().startswith("ollama:"):
+                    o_name = o_name[len("ollama:"):].strip()
+                if not o_name:
+                    self.screen.set_status("Type an Ollama model name (e.g. qwen2.5-coder:7b) and press Enter", C_WARN)
+                    self.screen.redraw()
+                    return
+                model = f"ollama:{o_name}"
+                self.active_model = model
+                self.model_effort = "none"
+                self.model_badge = model if len(model) <= 28 else model[:27] + "…"
+                self.screen.set_model_badge(self.model_badge)
+                self._question_state = None
+                self.screen.set_question(None)
+                self.screen.set_status(f"✓ Active model: {model}", C_CYAN)
+                self._send_line("<<SET_MODEL>>" + json.dumps({"model": model, "effort": "none", "budget": 0}))
+                if getattr(self, "current_chat_id", None):
+                    try:
+                        self.chat_db.update_chat_model(self.current_chat_id, model)
+                    except Exception:
+                        pass
+                turn = self.screen.new_turn("/models", is_system=True)
+                turn.ai_lines.append(f"✓ Switched active model to **{model}** (Ollama)")
+                self.screen.end_turn()
+                self.screen.redraw()
                 return
 
             if "mistral" in ans_clean:
